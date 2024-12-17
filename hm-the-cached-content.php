@@ -109,12 +109,12 @@ namespace {
 	 *
 	 * This function should only be called within the loop.
 	 *
-	 * @param int                $expiry         Optional. Expiry time (in seconds) before cache is invalidated. Default 5min.
 	 * @param string             $more_link_text Optional. Content for when there is more text.
 	 * @param bool               $strip_teaser   Optional. Strip teaser content before the more text. Default false.
 	 * @param WP_Post|object|int $post           Optional. WP_Post instance or Post ID/object. Default null.
+	 * @param int                $expiry         Optional. Expiry time (in seconds) before cache is invalidated. Default 5min.
 	 */
-	function the_cached_content( $expiry = MINUTE_IN_SECONDS * 5, $more_link_text = null, $strip_teaser = false, $post = null ) {
+	function the_cached_content( $more_link_text = null, $strip_teaser = false, $post = null, $expiry = MINUTE_IN_SECONDS * 5 ) {
 		$cache_key = The_Cached_Content\cache_key( $post );
 		$data = get_transient( $cache_key );
 
