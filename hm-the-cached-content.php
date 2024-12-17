@@ -8,6 +8,7 @@
 namespace The_Cached_Content {
 	use WP_Block_Type_Registry;
 	use WP_Block_Type;
+    use WP_Dependencies;
 
 	/**
 	 * Get a block by name from the global registry.
@@ -126,17 +127,24 @@ namespace The_Cached_Content {
 	}
 
 	/**
-	 * Serialize a WP Dependency to a JSON array.
+	 * Helper function to calculate which registered dependencies should be cached
+	 * for potential later restoration.
+	 *
+	 * @param \_WP_Dependencies $original_registry Original-state dependencies registry.
+	 * @param \_WP_Dependencies $new_registry      Freshly created dependencies registry.
+	 * @return array [ 'registered' => \_WP_Dependency[], 'queued' => string[] ] Dependencies to cache.
 	 */
-	function dependency_to_array( $dependency ) {
+	function diff_dependency_registries( \WP_Dependencies $original_registry, \WP_Dependencies $new_registry ) : array {
+		$dependencies = array_diff_key( $new_registry->registered, $original_registry->registered );
+		$queued = $new_registry->queue ?? [];
+		foreach ( $queued as $script_handle ) {
+			// Also store all enqueued deps which were previously registered
+			// to enable recreating the whole registered script list if needed.
+			$dependencies[ $script_handle ] = $new_registry->registered[ $script_handle ];
+		}
 		return [
-			'handle' => $dependency->handle ?? '',
-			'src'    => $dependency->src ?? false,
-			'deps'   => $dependency->deps ?? [],
-			'ver'    => $dependency->ver ?? false,
-			'args'   => $dependency->args ?? null,
-			'extra'  => $dependency->extra ?? [],
-			// Does not as yet support textdomain or translations_path.
+			'dependencies' => $dependencies,
+			'queued'       => $queued,
 		];
 	}
 
@@ -169,37 +177,15 @@ namespace {
 			the_content( $more_link_text, $strip_teaser );
 			$the_content = (string) ob_get_clean();
 
-			// $content_scripts = array_values( array_diff( $wp_scripts->queue ?? [], $known_scripts ) );
-			// $content_styles = array_values( array_diff( $wp_styles->queue ?? [], $known_styles ) );
-
-			// echo '<small><pre>';
-			// // print_r( $new_scripts );
-			// // print_r( wp_json_encode( [
-			// // 	'known' => $known_scripts,
-			// // 	'queue' => array_fill_keys( $wp_scripts->queue ?? [], 1 ),
-			// // ], JSON_PRETTY_PRINT ) );
-			// echo '</pre></small>';
-			// // echo '<small><pre>';
-			// // print_r( "\ndiff: " . wp_json_encode( $content_scripts ) );
-			// // echo '</pre></small>';
-
 			// Calculate all newly-registered or enqueued scripts.
-			$queued_scripts = $new_scripts->queue ?? [];
-			$registered_scripts = array_diff_key(
-				$new_scripts->registered,
-				$existing_scripts->registered
-			);
-			foreach ( $queued_scripts as $script_handle ) {
-				$registered_scripts[ $script_handle ] = $new_scripts->registered[ $script_handle ];
-			}
-			$queued_styles = $new_styles->queue ?? [];
-			$registered_styles = array_diff_key(
-				$new_styles->registered,
-				$existing_styles->registered
-			);
-			foreach ( $queued_styles as $style_handle ) {
-				$registered_styles[ $style_handle ] = $new_styles->registered[ $style_handle ];
-			}
+			[
+				'dependencies' => $registered_scripts,
+				'queued'       => $queued_scripts
+			] = The_Cached_Content\diff_dependency_registries( $existing_scripts, $new_scripts );
+			[
+				'dependencies' => $registered_styles,
+				'queued'       => $queued_styles,
+			] = The_Cached_Content\diff_dependency_registries( $existing_styles, $new_styles );
 
 			$data = [
 				'the_content'    => $the_content,
@@ -214,6 +200,10 @@ namespace {
 			// Restore cached globals.
 			$GLOBALS['wp_scripts'] = $existing_scripts;
 			$GLOBALS['wp_styles'] = $existing_styles;
+
+			echo '<pre>LIVE content</pre>';
+		} else {
+			echo '<pre>CACHED content</pre>';
 		}
 
 		foreach ( $data['scripts'] as $script_handle => $dependency ) {
@@ -225,11 +215,11 @@ namespace {
 		}
 		$GLOBALS['wp_styles']->queue = $data['queued_styles'];
 
-		echo '<small><pre>';
-		print_r( array_merge( $data, [
-			'the_content' => substr( esc_html( trim( str_replace( "\n", ' ', $data['the_content'] ) ) ), 0, 150 ) . '...',
-		] ) );
-		echo '</pre></small>';
+		// echo '<small><pre>';
+		// print_r( array_merge( $data, [
+		// 	'the_content' => substr( esc_html( trim( str_replace( "\n", ' ', $data['the_content'] ) ) ), 0, 150 ) . '...',
+		// ] ) );
+		// echo '</pre></small>';
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo $data['the_content'];
