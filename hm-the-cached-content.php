@@ -125,6 +125,21 @@ namespace The_Cached_Content {
 		flush_the_cached_content( $post );
 	}
 
+	/**
+	 * Serialize a WP Dependency to a JSON array.
+	 */
+	function dependency_to_array( $dependency ) {
+		return [
+			'handle' => $dependency->handle ?? '',
+			'src'    => $dependency->src ?? false,
+			'deps'   => $dependency->deps ?? [],
+			'ver'    => $dependency->ver ?? false,
+			'args'   => $dependency->args ?? null,
+			'extra'  => $dependency->extra ?? [],
+			// Does not as yet support textdomain or translations_path.
+		];
+	}
+
 	// Hook into the save_post action.
 	add_action( 'save_post', __NAMESPACE__ . '\\invalidate_post_cache', 10, 3 );
 }
@@ -144,44 +159,71 @@ namespace {
 		$data = get_transient( $cache_key );
 
 		if ( empty( $data['the_content'] ) ) {
-			global $wp_scripts;
-			global $wp_styles;
-			$known_scripts = $wp_scripts->queue ?? [];
-			$known_styles = $wp_styles->queue ?? [];
+			$existing_scripts = $GLOBALS['wp_scripts'];
+			$GLOBALS['wp_scripts'] = $new_scripts = new WP_Scripts();
+			$existing_styles = $GLOBALS['wp_styles'];
+			$GLOBALS['wp_styles'] = $new_styles = new WP_Styles();
 
 			// Render content. Will trigger script enqueues within WP_Block::render.
 			ob_start();
 			the_content( $more_link_text, $strip_teaser );
 			$the_content = (string) ob_get_clean();
 
-			$content_scripts = array_values( array_diff( $wp_scripts->queue ?? [], $known_scripts ) );
-			$content_styles = array_values( array_diff( $wp_styles->queue ?? [], $known_styles ) );
+			// $content_scripts = array_values( array_diff( $wp_scripts->queue ?? [], $known_scripts ) );
+			// $content_styles = array_values( array_diff( $wp_styles->queue ?? [], $known_styles ) );
 
-			echo '<small><pre>';
-			print_r( wp_json_encode( [
-				'known' => $known_scripts,
-				'queue' => array_fill_keys( $wp_scripts->queue ?? [], 1 ),
-			], JSON_PRETTY_PRINT ) );
-			echo '</pre></small>';
-			echo '<small><pre>';
-			print_r( "\ndiff: " . wp_json_encode( $content_scripts ) );
-			echo '</pre></small>';
+			// echo '<small><pre>';
+			// // print_r( $new_scripts );
+			// // print_r( wp_json_encode( [
+			// // 	'known' => $known_scripts,
+			// // 	'queue' => array_fill_keys( $wp_scripts->queue ?? [], 1 ),
+			// // ], JSON_PRETTY_PRINT ) );
+			// echo '</pre></small>';
+			// // echo '<small><pre>';
+			// // print_r( "\ndiff: " . wp_json_encode( $content_scripts ) );
+			// // echo '</pre></small>';
+
+			// Calculate all newly-registered or enqueued scripts.
+			$queued_scripts = $new_scripts->queue ?? [];
+			$registered_scripts = array_diff_key(
+				$new_scripts->registered,
+				$existing_scripts->registered
+			);
+			foreach ( $queued_scripts as $script_handle ) {
+				$registered_scripts[ $script_handle ] = $new_scripts->registered[ $script_handle ];
+			}
+			$queued_styles = $new_styles->queue ?? [];
+			$registered_styles = array_diff_key(
+				$new_styles->registered,
+				$existing_styles->registered
+			);
+			foreach ( $queued_styles as $style_handle ) {
+				$registered_styles[ $style_handle ] = $new_styles->registered[ $style_handle ];
+			}
 
 			$data = [
-				'the_content' => $the_content,
-				'scripts'     => $content_scripts,
-				'styles'      => $content_styles,
+				'the_content'    => $the_content,
+				'scripts'        => $registered_scripts,
+				'queued_scripts' => $queued_scripts,
+				'styles'         => $registered_styles,
+				'queued_styles'  => $queued_styles,
 			];
 
 			set_transient( $cache_key, $data, $expiry );
-		} else {
-			foreach ( $data['scripts'] as $script_handle ) {
-				wp_enqueue_script( $script_handle );
-			}
-			foreach ( $data['styles'] as $style_handle ) {
-				wp_enqueue_style( $style_handle );
-			}
+
+			// Restore cached globals.
+			$GLOBALS['wp_scripts'] = $existing_scripts;
+			$GLOBALS['wp_styles'] = $existing_styles;
 		}
+
+		foreach ( $data['scripts'] as $script_handle => $dependency ) {
+			$GLOBALS['wp_scripts']->registered[ $script_handle ] = $dependency;
+		}
+		$GLOBALS['wp_scripts']->queue = $data['queued_scripts'];
+		foreach ( $data['styles'] as $style_handle => $dependency ) {
+			$GLOBALS['wp_styles']->registered[ $style_handle ] = $dependency;
+		}
+		$GLOBALS['wp_styles']->queue = $data['queued_styles'];
 
 		echo '<small><pre>';
 		print_r( array_merge( $data, [
