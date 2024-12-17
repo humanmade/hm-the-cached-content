@@ -18,8 +18,6 @@ namespace The_Cached_Content {
 	/**
 	 * Generate a hashed cache key for a post's content.
 	 *
-	 * @param string             $more_link_text Optional. Content for when there is more text.
-	 * @param bool               $strip_teaser   Optional. Strip teaser content before the more text. Default false.
 	 * @param WP_Post|object|int $post           Optional. WP_Post instance or Post ID/object. Default null.
 	 * @return string
 	 */
@@ -154,21 +152,19 @@ namespace {
 			// Restore cached globals.
 			$GLOBALS['wp_scripts'] = $existing_scripts;
 			$GLOBALS['wp_styles'] = $existing_styles;
-
-			echo '<pre>LIVE content</pre>';
-		} else {
-			echo '<pre>CACHED content</pre>';
 		}
 
+		// Once we have cache data (or have computed what gets rendered during
+		// the_content), ensure all of that data is in the global registries.
 		$GLOBALS['wp_scripts'] = The_Cached_Content\update_dependency_registry(
 			$GLOBALS['wp_scripts'],
-			$data['scripts'],
-			$data['queued_scripts']
+			$data['scripts'] ?? [],
+			$data['queued_scripts'] ?? []
 		);
 		$GLOBALS['wp_styles'] = The_Cached_Content\update_dependency_registry(
 			$GLOBALS['wp_styles'],
-			$data['styles'],
-			$data['queued_styles']
+			$data['styles'] ?? [],
+			$data['queued_styles'] ?? []
 		);
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
