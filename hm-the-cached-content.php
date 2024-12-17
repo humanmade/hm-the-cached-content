@@ -2,7 +2,9 @@
 /**
  * Plugin Name: The_Cached_Content()
  * Plugin Description: Provides a template function for fragment-caching the_content() without breaking styles.
- * Plugin Author: Human Made
+ * Author: Human Made
+ * Version: 0.1.0
+ * Author URI: https://humanmade.com/
  */
 
 namespace The_Cached_Content {
