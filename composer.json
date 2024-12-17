@@ -1,0 +1,11 @@
+{
+  "name": "humanmade/hm-the-cached-content",
+  "type": "wordpress-plugin",
+  "license": "GPL-2.0-or-later",
+  "authors": [
+    {
+      "name": "Human Made",
+      "email": "hello@humanmade.com"
+    }
+  ]
+}
