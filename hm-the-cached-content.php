@@ -6,84 +6,14 @@
  */
 
 namespace The_Cached_Content {
-	use WP_Block_Type_Registry;
-	use WP_Block_Type;
-    use WP_Dependencies;
+	use WP_Post;
 
-	/**
-	 * Get a block by name from the global registry.
-	 *
-	 * @param string $block_name Block type name.
-	 * @return WP_Block_Type|null Block type object, or null if not registered.
-	 */
-	function get_block_type( string $block_name ) : ?WP_Block_Type {
-		return WP_Block_Type_Registry::get_instance()->get_registered( $block_name );
+	/** Connect namespace functions to actions and hooks. */
+	function bootstrap() : void {
+		// Hook into the save_post action.
+		add_action( 'save_post', __NAMESPACE__ . '\\invalidate_post_cache', 10, 3 );
 	}
-
-	/**
-	 * Recursively identify script and style handles in an array of parsed blocks.
-	 *
-	 * @param array[] $blocks Array of parse_blocks() output.
-	 * @return array[] Array of `[ 'style' => string[], 'script' => string[] ]` handles.
-	 */
-	function identify_block_assets_recursive( array $blocks ) : array {
-		$assets = [ 'style' => [], 'script' => [], 'script_module' => [] ];
-
-		foreach ( $blocks as $block ) {
-			if ( ! empty( $block['blockName'] ) ) {
-				$block_type = get_block_type( $block['blockName'] );
-
-				// Mirror the style handle processing in WP_Block::render.
-				if ( ( ! empty( $block_type->script_handles ) ) ) {
-					foreach ( $block_type->script_handles as $script_handle ) {
-						$assets['script'][ $script_handle ] = true;
-					}
-				}
-
-				if ( ! empty( $block_type->view_script_handles ) ) {
-					foreach ( $block_type->view_script_handles as $view_script_handle ) {
-						$assets['script'][ $view_script_handle ] = true;
-					}
-				}
-
-				if ( ! empty( $block_type->view_script_module_ids ) ) {
-					foreach ( $block_type->view_script_module_ids as $view_script_module_id ) {
-						$assets['script_module'][ $view_script_module_id ] = true;
-					}
-				}
-
-				if ( ( ! empty( $block_type->style_handles ) ) ) {
-					foreach ( $block_type->style_handles as $style_handle ) {
-						$assets['style'][ $style_handle ] = true;
-					}
-				}
-
-				if ( ( ! empty( $block_type->view_style_handles ) ) ) {
-					foreach ( $block_type->view_style_handles as $view_style_handle ) {
-						$assets['style'][ $view_style_handle ] = true;
-					}
-				}
-			}
-
-			if ( ! empty( $block['innerBlocks'] ) ) {
-				$assets = array_merge_recursive( $assets, identify_block_assets_recursive( $block['innerBlocks'] ) );
-			}
-		}
-
-		return $assets;
-	}
-
-	/**
-	 * Given a post's raw post_content, iterate through the included blocks to
-	 * build a comprehensive list of associated style and script handles.
-	 *
-	 * @param string $content The raw post_content.
-	 * @return array[] Array of `[ 'style' => string[], 'script' => string[] ]` handles.
-	 */
-	function identify_block_assets( string $content ) : array {
-		$assets = identify_block_assets_recursive( parse_blocks( $content ) );
-		return $assets;
-	}
+	bootstrap();
 
 	/**
 	 * Generate a hashed cache key for a post's content.
@@ -94,7 +24,9 @@ namespace The_Cached_Content {
 	 * @return string
 	 */
 	function cache_key( $post = null ) : string {
-		$post_id = is_int( $post ) ? $post : ( get_post( $post )->ID ?? null );
+		$post_id = is_int( $post )
+			? $post
+			: ( get_post( $post )->ID ?? null );
 		return 'the_cached_content_' . md5( $post_id );
 	}
 
@@ -107,7 +39,14 @@ namespace The_Cached_Content {
 		delete_transient( cache_key( $post ) );
 	}
 
-	function invalidate_post_cache( int $post_id, \WP_Post $post, bool $update ) {
+	/**
+	 * Invalidate the cache for a post when it is saved.
+	 *
+	 * @param int     $post_id The post ID.
+	 * @param WP_Post $post    The post object.
+	 * @param bool    $update  Whether this is an existing post being updated.
+	 */
+	function invalidate_post_cache( int $post_id, WP_Post $post, bool $update ) {
 		// Check if this is an autosave or a revision, and bail if it is.
 		if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
 			return;
@@ -127,35 +66,50 @@ namespace The_Cached_Content {
 	}
 
 	/**
+	 * Merge any new entries into the original registry.
+	 *
+	 * @param \WP_Dependencies  $dependencies Original WP_Dependencies registry.
+	 * @param \_WP_Dependency[] $registered   Dependencies registered or enqueued during rendering.
+	 * @param string[]          $queue        Content-enqueued dependencies.
+	 * @return \WP_Dependencies Original registry with new entries injected.
+	 */
+	function update_dependency_registry( $dependencies, $registered, $queue ) {
+		foreach ( $registered as $dependency_handle => $dependency ) {
+			$dependencies->registered[ $dependency_handle ] = $dependency;
+		}
+		$dependencies->queue = array_unique( array_merge( $dependencies->queue, $queue ) );
+		return $dependencies;
+	}
+
+	/**
 	 * Helper function to calculate which registered dependencies should be cached
 	 * for potential later restoration.
 	 *
-	 * @param \_WP_Dependencies $original_registry Original-state dependencies registry.
-	 * @param \_WP_Dependencies $new_registry      Freshly created dependencies registry.
-	 * @return array [ 'registered' => \_WP_Dependency[], 'queued' => string[] ] Dependencies to cache.
+	 * @param \WP_Dependencies $original_registry Original-state dependencies registry.
+	 * @param \WP_Dependencies $new_registry      Freshly created dependencies registry.
+	 * @return array [ 'registered' => \_WP_Dependency[], 'queue' => string[] ] Dependencies to cache.
 	 */
-	function diff_dependency_registries( \WP_Dependencies $original_registry, \WP_Dependencies $new_registry ) : array {
+	function diff_dependency_registries( $original_registry, $new_registry ) : array {
 		$dependencies = array_diff_key( $new_registry->registered, $original_registry->registered );
-		$queued = $new_registry->queue ?? [];
-		foreach ( $queued as $script_handle ) {
+		$queue = $new_registry->queue ?? [];
+		foreach ( $queue as $script_handle ) {
 			// Also store all enqueued deps which were previously registered
 			// to enable recreating the whole registered script list if needed.
 			$dependencies[ $script_handle ] = $new_registry->registered[ $script_handle ];
 		}
 		return [
 			'dependencies' => $dependencies,
-			'queued'       => $queued,
+			'queue'        => $queue,
 		];
 	}
-
-	// Hook into the save_post action.
-	add_action( 'save_post', __NAMESPACE__ . '\\invalidate_post_cache', 10, 3 );
 }
 
 // Global template function.
 namespace {
 	/**
 	 * Displays the post content with a context-aware caching layer.
+	 *
+	 * This function should only be called within the loop.
 	 *
 	 * @param string             $more_link_text Optional. Content for when there is more text.
 	 * @param bool               $strip_teaser   Optional. Strip teaser content before the more text. Default false.
@@ -180,11 +134,11 @@ namespace {
 			// Calculate all newly-registered or enqueued scripts.
 			[
 				'dependencies' => $registered_scripts,
-				'queued'       => $queued_scripts
+				'queue'        => $queued_scripts
 			] = The_Cached_Content\diff_dependency_registries( $existing_scripts, $new_scripts );
 			[
 				'dependencies' => $registered_styles,
-				'queued'       => $queued_styles,
+				'queue'        => $queued_styles,
 			] = The_Cached_Content\diff_dependency_registries( $existing_styles, $new_styles );
 
 			$data = [
@@ -206,20 +160,16 @@ namespace {
 			echo '<pre>CACHED content</pre>';
 		}
 
-		foreach ( $data['scripts'] as $script_handle => $dependency ) {
-			$GLOBALS['wp_scripts']->registered[ $script_handle ] = $dependency;
-		}
-		$GLOBALS['wp_scripts']->queue = $data['queued_scripts'];
-		foreach ( $data['styles'] as $style_handle => $dependency ) {
-			$GLOBALS['wp_styles']->registered[ $style_handle ] = $dependency;
-		}
-		$GLOBALS['wp_styles']->queue = $data['queued_styles'];
-
-		// echo '<small><pre>';
-		// print_r( array_merge( $data, [
-		// 	'the_content' => substr( esc_html( trim( str_replace( "\n", ' ', $data['the_content'] ) ) ), 0, 150 ) . '...',
-		// ] ) );
-		// echo '</pre></small>';
+		$GLOBALS['wp_scripts'] = The_Cached_Content\update_dependency_registry(
+			$GLOBALS['wp_scripts'],
+			$data['scripts'],
+			$data['queued_scripts']
+		);
+		$GLOBALS['wp_styles'] = The_Cached_Content\update_dependency_registry(
+			$GLOBALS['wp_styles'],
+			$data['styles'],
+			$data['queued_styles']
+		);
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo $data['the_content'];
