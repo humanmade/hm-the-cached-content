@@ -129,6 +129,12 @@ namespace {
 			the_content( $more_link_text, $strip_teaser );
 			$the_content = (string) ob_get_clean();
 
+			// Enqueue all stored styles so that inline stylesheets may be included
+			// in the dependency diff. This normally happens in wp_footer, but we can
+			// call it here because we're using a temporary WP_Styles which will be
+			// replaced with the original registry after this.
+			wp_enqueue_stored_styles();
+
 			// Calculate all newly-registered or enqueued scripts.
 			[
 				'dependencies' => $registered_scripts,
