@@ -95,7 +95,7 @@ namespace The_Cached_Content {
 		foreach ( $queue as $script_handle ) {
 			// Also store all enqueued deps which were previously registered
 			// to enable recreating the whole registered script list if needed.
-			$dependencies[ $script_handle ] = $new_registry->registered[ $script_handle ] ?? $new_registry->queued_before_register[ $script_handle ];
+			$dependencies[ $script_handle ] = $new_registry->registered[ $script_handle ];
 		}
 		return [
 			'dependencies' => $dependencies,
@@ -138,7 +138,6 @@ namespace {
 			// Render content. Will trigger script enqueues within WP_Block::render.
 			ob_start();
 			the_content( $more_link_text, $strip_teaser );
-			do_action( 'wp_enqueue_scripts' );
 			$the_content = (string) ob_get_clean();
 
 			// Enqueue all stored styles so that inline stylesheets may be included
@@ -205,8 +204,6 @@ namespace {
 				}
 			}
 		}
-
-		// wp_enqueue_registered_block_scripts_and_styles();
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo $data['the_content'];
