@@ -126,6 +126,15 @@ namespace {
 			$existing_styles = $GLOBALS['wp_styles'];
 			$GLOBALS['wp_styles'] = $new_styles = new WP_Styles();
 
+			// Track all blocks used so we can enqueue their assets manually.
+			$used_blocks = [];
+			add_filter( 'render_block', function( $block_content, $block ) use ( &$used_blocks ) {
+				if ( ! empty( $block['blockName'] ) ) {
+					$used_blocks[ $block['blockName'] ] = true;
+				}
+				return $block_content;
+			}, 1, 2 );
+
 			// Render content. Will trigger script enqueues within WP_Block::render.
 			ob_start();
 			the_content( $more_link_text, $strip_teaser );
@@ -153,6 +162,7 @@ namespace {
 				'queued_scripts' => $queued_scripts,
 				'styles'         => $registered_styles,
 				'queued_styles'  => $queued_styles,
+				'used_blocks'    => $used_blocks,
 			];
 
 			set_transient( $cache_key, $data, $expiry );
@@ -174,6 +184,26 @@ namespace {
 			$data['styles'] ?? [],
 			$data['queued_styles'] ?? []
 		);
+
+		// Re-register each block that was used in the cached content
+		$all_blocks = WP_Block_Type_Registry::get_instance()->get_all_registered();
+
+		foreach ( $all_blocks as $block_type ) {
+			if ( ! array_key_exists( $block_type->name, $data['used_blocks'] ) ) {
+				continue;
+			}
+
+			if ( ! empty( $block_type->view_script_handles ) ) {
+				foreach ( $block_type->view_script_handles as $handle ) {
+					wp_enqueue_script( $handle );
+				}
+			}
+			if ( ! empty( $block_type->style_handles ) ) {
+				foreach ( $block_type->style_handles as $handle ) {
+					wp_enqueue_style( $handle );
+				}
+			}
+		}
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo $data['the_content'];
