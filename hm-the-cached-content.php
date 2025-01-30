@@ -165,6 +165,13 @@ namespace {
 				'used_blocks'    => $used_blocks,
 			];
 
+			/**
+			 * Modify the cached data used to reconstitute this content from cache.
+			 *
+			 * @param [] $data Data to be cached.
+			 */
+			$data = apply_filters( 'cached_content_data', $data );
+
 			set_transient( $cache_key, $data, $expiry );
 
 			// Restore cached globals.
@@ -204,6 +211,13 @@ namespace {
 				}
 			}
 		}
+
+		/**
+		 * Perform additional actions when outputting cached content.
+		 *
+		 * @param [] $data Data in cache.
+		 */
+		do_action( 'cached_content_output', $data );
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo $data['the_content'];
