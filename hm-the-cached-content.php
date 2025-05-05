@@ -27,7 +27,8 @@ namespace The_Cached_Content {
 		$post_id = is_int( $post )
 			? $post
 			: ( get_post( $post )->ID ?? null );
-		return 'the_cached_content_' . md5( $post_id );
+
+		return apply_filters( 'cached_content_cache_key', 'the_cached_content_' . md5( $post_id ), $post_id );
 	}
 
 	/**
