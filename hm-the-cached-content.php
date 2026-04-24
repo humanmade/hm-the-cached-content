@@ -166,9 +166,26 @@ namespace The_Cached_Content {
 	 */
 	function replay_diff( WP_Dependencies $deps, array $diff ) : WP_Dependencies {
 		foreach ( $diff['registered'] ?? [] as $handle => $dep ) {
-			if ( $dep instanceof \_WP_Dependency ) {
-				$deps->registered[ $handle ] = $dep;
+			if ( ! ( $dep instanceof \_WP_Dependency ) ) {
+				continue;
 			}
+			// If the handle was registered in the temp registry during render
+			// but has since been registered on the real registry too (e.g.
+			// `core-block-supports`, which core registers inside
+			// `wp_enqueue_stored_styles` at `wp_enqueue_scripts` priority 10),
+			// don't overwrite it. Merge the cached `extra` data onto the live
+			// dep instead so both sets of inline CSS survive.
+			if ( isset( $deps->registered[ $handle ] ) ) {
+				$cached_extra = isset( $dep->extra ) && is_array( $dep->extra ) ? $dep->extra : [];
+				if ( $cached_extra ) {
+					$diff['extras'][ $handle ] = array_merge_recursive(
+						$diff['extras'][ $handle ] ?? [],
+						$cached_extra
+					);
+				}
+				continue;
+			}
+			$deps->registered[ $handle ] = $dep;
 		}
 
 		foreach ( $diff['extras'] ?? [] as $handle => $delta ) {
@@ -211,6 +228,50 @@ namespace The_Cached_Content {
 	 */
 	function deep_clone_dependencies( WP_Dependencies $deps ) : WP_Dependencies {
 		return unserialize( serialize( $deps ) );
+	}
+
+	/**
+	 * Apply the cached dependency diff now, or defer until `wp_enqueue_scripts`
+	 * has fired if we're running earlier in the request.
+	 *
+	 * Deferring matters because callers like the early term-content render
+	 * hooked to `pre_get_posts` run before core enqueues things like
+	 * `global-styles` and `core-block-supports`. Merging directly in that
+	 * window would prepend the cached handles to the style queue and flip
+	 * the CSS cascade order at print time.
+	 */
+	function apply_or_defer_replay( array $data ) : void {
+		$apply = function () use ( $data ) : void {
+			$GLOBALS['wp_scripts'] = replay_diff( $GLOBALS['wp_scripts'], $data['scripts'] ?? [] );
+			$GLOBALS['wp_styles']  = replay_diff( $GLOBALS['wp_styles'],  $data['styles'] ?? [] );
+
+			$all_blocks = \WP_Block_Type_Registry::get_instance()->get_all_registered();
+			foreach ( $all_blocks as $block_type ) {
+				if ( ! array_key_exists( $block_type->name, $data['used_blocks'] ?? [] ) ) {
+					continue;
+				}
+				if ( ! empty( $block_type->view_script_handles ) ) {
+					foreach ( $block_type->view_script_handles as $handle ) {
+						wp_enqueue_script( $handle );
+					}
+				}
+				if ( ! empty( $block_type->style_handles ) ) {
+					foreach ( $block_type->style_handles as $handle ) {
+						wp_enqueue_style( $handle );
+					}
+				}
+			}
+		};
+
+		if ( did_action( 'wp_enqueue_scripts' ) ) {
+			$apply();
+			return;
+		}
+
+		// Priority 100 runs after core-registered enqueue callbacks, so the
+		// cached handles are appended to the queue in the same relative
+		// position they would occupy during a non-cached render.
+		add_action( 'wp_enqueue_scripts', $apply, 100 );
 	}
 }
 
@@ -293,35 +354,10 @@ namespace {
 			$GLOBALS['wp_styles']  = $existing_styles;
 		}
 
-		// Replay the cached diff into the live registries.
-		$GLOBALS['wp_scripts'] = The_Cached_Content\replay_diff(
-			$GLOBALS['wp_scripts'],
-			$data['scripts'] ?? []
-		);
-		$GLOBALS['wp_styles'] = The_Cached_Content\replay_diff(
-			$GLOBALS['wp_styles'],
-			$data['styles'] ?? []
-		);
-
-		// Re-enqueue each used block's declared assets as a safety net for
-		// handles the block type registers at init (its style_handles /
-		// view_script_handles) which the diff may not cover.
-		$all_blocks = WP_Block_Type_Registry::get_instance()->get_all_registered();
-		foreach ( $all_blocks as $block_type ) {
-			if ( ! array_key_exists( $block_type->name, $data['used_blocks'] ?? [] ) ) {
-				continue;
-			}
-			if ( ! empty( $block_type->view_script_handles ) ) {
-				foreach ( $block_type->view_script_handles as $handle ) {
-					wp_enqueue_script( $handle );
-				}
-			}
-			if ( ! empty( $block_type->style_handles ) ) {
-				foreach ( $block_type->style_handles as $handle ) {
-					wp_enqueue_style( $handle );
-				}
-			}
-		}
+		// Apply the cached diff now, or defer until after wp_enqueue_scripts
+		// fires so cached handles print in the same relative cascade position
+		// they would during a non-cached render.
+		The_Cached_Content\apply_or_defer_replay( $data );
 
 		/**
 		 * Perform additional actions when outputting cached content.
