@@ -3,16 +3,18 @@
  * Plugin Name: The_Cached_Content()
  * Plugin Description: Provides a template function for fragment-caching the_content() without breaking styles.
  * Author: Human Made
- * Version: 0.2.0
+ * Version: 0.3.0
  * Author URI: https://humanmade.com/
  */
 
 namespace The_Cached_Content {
 	use WP_Post;
+	use WP_Dependencies;
+
+	const CACHE_VERSION = 2;
 
 	/** Connect namespace functions to actions and hooks. */
 	function bootstrap() : void {
-		// Hook into the save_post action.
 		add_action( 'save_post', __NAMESPACE__ . '\\invalidate_post_cache', 10, 3 );
 	}
 	bootstrap();
@@ -20,7 +22,7 @@ namespace The_Cached_Content {
 	/**
 	 * Generate a hashed cache key for a post's content.
 	 *
-	 * @param WP_Post|object|int $post           Optional. WP_Post instance or Post ID/object. Default null.
+	 * @param WP_Post|object|int $post Optional. WP_Post instance or Post ID/object. Default null.
 	 * @return string
 	 */
 	function cache_key( $post = null ) : string {
@@ -48,67 +50,174 @@ namespace The_Cached_Content {
 	 * @param bool    $update  Whether this is an existing post being updated.
 	 */
 	function invalidate_post_cache( int $post_id, WP_Post $post, bool $update ) {
-		// Check if this is an autosave or a revision, and bail if it is.
 		if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
 			return;
 		}
-
-		// Ensure it's only triggered for published posts.
 		if ( $post->post_status !== 'publish' ) {
 			return;
 		}
-
 		if ( wp_is_post_revision( $post_id ) ) {
 			return;
 		}
 
-		// Run your custom function.
 		flush_the_cached_content( $post );
 	}
 
 	/**
-	 * Merge any new entries into the original registry.
+	 * Snapshot the state of a dependencies registry prior to rendering.
 	 *
-	 * @param \WP_Dependencies  $dependencies Original WP_Dependencies registry.
-	 * @param \_WP_Dependency[] $registered   Dependencies registered or enqueued during rendering.
-	 * @param string[]          $queue        Content-enqueued dependencies.
-	 * @return \WP_Dependencies Original registry with new entries injected.
+	 * Captures the set of registered handles, the `extra` array on each dep
+	 * (which is where `wp_add_inline_style()` data lives), and the current
+	 * queue. A post-render diff uses this to identify exactly what the_content
+	 * caused to be registered, extended, or enqueued.
+	 *
+	 * @param WP_Dependencies $deps Registry to snapshot.
+	 * @return array
 	 */
-	function update_dependency_registry( $dependencies, $registered, $queue ) {
-		foreach ( $registered as $dependency_handle => $dependency ) {
-			$dependencies->registered[ $dependency_handle ] = $dependency;
+	function snapshot_dependencies( WP_Dependencies $deps ) : array {
+		$extras = [];
+		foreach ( $deps->registered as $handle => $dep ) {
+			$extras[ $handle ] = isset( $dep->extra ) && is_array( $dep->extra )
+				? $dep->extra
+				: [];
 		}
-		$dependencies->queue = array_unique( array_merge( $dependencies->queue, $queue ) );
-		return $dependencies;
+		return [
+			'handles' => array_keys( $deps->registered ),
+			'extras'  => $extras,
+			'queue'   => is_array( $deps->queue ) ? $deps->queue : [],
+		];
 	}
 
 	/**
-	 * Helper function to calculate which registered dependencies should be cached
-	 * for potential later restoration.
+	 * Diff a registry's current state against a prior snapshot.
 	 *
-	 * @param \WP_Dependencies $original_registry Original-state dependencies registry.
-	 * @param \WP_Dependencies $new_registry      Freshly created dependencies registry.
-	 * @return array [ 'registered' => \_WP_Dependency[], 'queue' => string[] ] Dependencies to cache.
+	 * Returns three buckets:
+	 *  - `registered`: wholly new deps registered during render.
+	 *  - `extras`: new entries added to existing deps' `extra` arrays
+	 *    (e.g. inline styles attached via `wp_add_inline_style` to a handle
+	 *    that was pre-registered at `init`).
+	 *  - `queue`: handles enqueued during render.
+	 *
+	 * @param WP_Dependencies $deps     Post-render registry.
+	 * @param array           $snapshot Output of snapshot_dependencies().
+	 * @return array
 	 */
-	function diff_dependency_registries( $original_registry, $new_registry ) : array {
-		$dependencies = array_diff_key( $new_registry->registered, $original_registry->registered );
-		$queue = $new_registry->queue ?? [];
-		foreach ( $queue as $script_handle ) {
-			// Also store all enqueued deps which were previously registered
-			// to enable recreating the whole registered script list if needed.
-			$dependencies[ $script_handle ] = $new_registry->registered[ $script_handle ];
+	function diff_against_snapshot( WP_Dependencies $deps, array $snapshot ) : array {
+		$registered = [];
+		$extras     = [];
+		$known      = array_flip( $snapshot['handles'] ?? [] );
+
+		foreach ( $deps->registered as $handle => $dep ) {
+			if ( ! isset( $known[ $handle ] ) ) {
+				$registered[ $handle ] = $dep;
+				continue;
+			}
+
+			$before = $snapshot['extras'][ $handle ] ?? [];
+			$after  = isset( $dep->extra ) && is_array( $dep->extra ) ? $dep->extra : [];
+			$delta  = [];
+
+			foreach ( $after as $key => $value ) {
+				$prior = $before[ $key ] ?? null;
+				if ( $value === $prior ) {
+					continue;
+				}
+				if ( is_array( $value ) && is_array( $prior ) ) {
+					$new_items = array_values( array_diff( $value, $prior ) );
+					if ( $new_items ) {
+						$delta[ $key ] = $new_items;
+					}
+				} elseif ( is_array( $value ) ) {
+					$delta[ $key ] = array_values( $value );
+				} else {
+					$delta[ $key ] = $value;
+				}
+			}
+
+			if ( $delta ) {
+				$extras[ $handle ] = $delta;
+			}
 		}
+
+		$queue = array_values( array_diff(
+			is_array( $deps->queue ) ? $deps->queue : [],
+			$snapshot['queue'] ?? []
+		) );
+
 		return [
-			'dependencies' => $dependencies,
-			'queue'        => $queue,
+			'registered' => $registered,
+			'extras'     => $extras,
+			'queue'      => $queue,
 		];
+	}
+
+	/**
+	 * Apply a cached diff to a live registry.
+	 *
+	 * - New registrations are added directly.
+	 * - `extras` are *appended* to existing deps' `extra` arrays rather than
+	 *   replacing them, so inline styles survive even if another request-time
+	 *   code path has also attached data to the same handle.
+	 * - Queue handles are merged in.
+	 *
+	 * @param WP_Dependencies $deps Live registry to modify.
+	 * @param array           $diff Output of diff_against_snapshot().
+	 * @return WP_Dependencies
+	 */
+	function replay_diff( WP_Dependencies $deps, array $diff ) : WP_Dependencies {
+		foreach ( $diff['registered'] ?? [] as $handle => $dep ) {
+			if ( $dep instanceof \_WP_Dependency ) {
+				$deps->registered[ $handle ] = $dep;
+			}
+		}
+
+		foreach ( $diff['extras'] ?? [] as $handle => $delta ) {
+			if ( ! isset( $deps->registered[ $handle ] ) ) {
+				continue;
+			}
+			$dep = $deps->registered[ $handle ];
+			if ( ! isset( $dep->extra ) || ! is_array( $dep->extra ) ) {
+				$dep->extra = [];
+			}
+			foreach ( $delta as $key => $value ) {
+				if ( is_array( $value ) ) {
+					$existing = isset( $dep->extra[ $key ] ) && is_array( $dep->extra[ $key ] )
+						? $dep->extra[ $key ]
+						: [];
+					$dep->extra[ $key ] = array_values( array_unique( array_merge( $existing, $value ) ) );
+				} else {
+					$dep->extra[ $key ] = $value;
+				}
+			}
+		}
+
+		if ( ! empty( $diff['queue'] ) ) {
+			$deps->queue = array_values( array_unique( array_merge(
+				is_array( $deps->queue ) ? $deps->queue : [],
+				$diff['queue']
+			) ) );
+		}
+
+		return $deps;
+	}
+
+	/**
+	 * Produce a deep copy of a dependencies registry so that render-time
+	 * mutations (e.g. `wp_add_inline_style` appending to a pre-registered
+	 * handle's `extra['after']`) do not leak back to the real registry.
+	 *
+	 * @param WP_Dependencies $deps
+	 * @return WP_Dependencies
+	 */
+	function deep_clone_dependencies( WP_Dependencies $deps ) : WP_Dependencies {
+		return unserialize( serialize( $deps ) );
 	}
 }
 
 // Global template function.
 namespace {
 	/**
-	 * Displays the post content with a context-aware caching layer.
+	 * Display the post content with a context-aware caching layer.
 	 *
 	 * This function should only be called within the loop.
 	 *
@@ -121,86 +230,87 @@ namespace {
 		$cache_key = The_Cached_Content\cache_key( $post );
 		$data = get_transient( $cache_key );
 
+		// Treat pre-v2 cache entries as misses so their stale format is not replayed.
+		if ( ! empty( $data ) && ( $data['version'] ?? 0 ) !== The_Cached_Content\CACHE_VERSION ) {
+			$data = false;
+		}
+
 		if ( empty( $data['the_content'] ) ) {
+			// Deep-clone the real registries so that render-time calls like
+			// wp_add_inline_style() on pre-registered handles succeed (they
+			// require the handle to already exist in the current registry),
+			// without mutating the real registry in place.
 			$existing_scripts = $GLOBALS['wp_scripts'];
-			$GLOBALS['wp_scripts'] = $new_scripts = new WP_Scripts();
-			$existing_styles = $GLOBALS['wp_styles'];
-			$GLOBALS['wp_styles'] = $new_styles = new WP_Styles();
+			$existing_styles  = $GLOBALS['wp_styles'];
+			$GLOBALS['wp_scripts'] = The_Cached_Content\deep_clone_dependencies( $existing_scripts );
+			$GLOBALS['wp_styles']  = The_Cached_Content\deep_clone_dependencies( $existing_styles );
+
+			$scripts_snapshot = The_Cached_Content\snapshot_dependencies( $GLOBALS['wp_scripts'] );
+			$styles_snapshot  = The_Cached_Content\snapshot_dependencies( $GLOBALS['wp_styles'] );
 
 			// Track all blocks used so we can enqueue their assets manually.
 			$used_blocks = [];
-			add_filter( 'render_block', function( $block_content, $block ) use ( &$used_blocks ) {
+			$tracker = function ( $block_content, $block ) use ( &$used_blocks ) {
 				if ( ! empty( $block['blockName'] ) ) {
 					$used_blocks[ $block['blockName'] ] = true;
 				}
 				return $block_content;
-			}, 1, 2 );
+			};
+			add_filter( 'render_block', $tracker, 1, 2 );
 
-			// Render content. Will trigger script enqueues within WP_Block::render.
 			ob_start();
 			the_content( $more_link_text, $strip_teaser );
 			$the_content = (string) ob_get_clean();
 
-			// Enqueue all stored styles so that inline stylesheets may be included
-			// in the dependency diff. This normally happens in wp_footer, but we can
-			// call it here because we're using a temporary WP_Styles which will be
-			// replaced with the original registry after this.
+			remove_filter( 'render_block', $tracker, 1 );
+
+			// Flush any style-engine-stored block-support rules into the temp
+			// registry so the compiled inline stylesheet is captured in the diff.
 			wp_enqueue_stored_styles();
 
-			// Calculate all newly-registered or enqueued scripts.
-			[
-				'dependencies' => $registered_scripts,
-				'queue'        => $queued_scripts
-			] = The_Cached_Content\diff_dependency_registries( $existing_scripts, $new_scripts );
-			[
-				'dependencies' => $registered_styles,
-				'queue'        => $queued_styles,
-			] = The_Cached_Content\diff_dependency_registries( $existing_styles, $new_styles );
+			$script_diff = The_Cached_Content\diff_against_snapshot( $GLOBALS['wp_scripts'], $scripts_snapshot );
+			$style_diff  = The_Cached_Content\diff_against_snapshot( $GLOBALS['wp_styles'], $styles_snapshot );
 
 			$data = [
-				'the_content'    => $the_content,
-				'scripts'        => $registered_scripts,
-				'queued_scripts' => $queued_scripts,
-				'styles'         => $registered_styles,
-				'queued_styles'  => $queued_styles,
-				'used_blocks'    => $used_blocks,
+				'version'     => The_Cached_Content\CACHE_VERSION,
+				'the_content' => $the_content,
+				'scripts'     => $script_diff,
+				'styles'      => $style_diff,
+				'used_blocks' => $used_blocks,
 			];
 
 			/**
 			 * Modify the cached data used to reconstitute this content from cache.
 			 *
-			 * @param [] $data Data to be cached.
+			 * @param array $data Data to be cached.
 			 */
 			$data = apply_filters( 'cached_content_data', $data );
 
 			set_transient( $cache_key, $data, $expiry );
 
-			// Restore cached globals.
+			// Restore the real registries.
 			$GLOBALS['wp_scripts'] = $existing_scripts;
-			$GLOBALS['wp_styles'] = $existing_styles;
+			$GLOBALS['wp_styles']  = $existing_styles;
 		}
 
-		// Once we have cache data (or have computed what gets rendered during
-		// the_content), ensure all of that data is in the global registries.
-		$GLOBALS['wp_scripts'] = The_Cached_Content\update_dependency_registry(
+		// Replay the cached diff into the live registries.
+		$GLOBALS['wp_scripts'] = The_Cached_Content\replay_diff(
 			$GLOBALS['wp_scripts'],
-			$data['scripts'] ?? [],
-			$data['queued_scripts'] ?? []
+			$data['scripts'] ?? []
 		);
-		$GLOBALS['wp_styles'] = The_Cached_Content\update_dependency_registry(
+		$GLOBALS['wp_styles'] = The_Cached_Content\replay_diff(
 			$GLOBALS['wp_styles'],
-			$data['styles'] ?? [],
-			$data['queued_styles'] ?? []
+			$data['styles'] ?? []
 		);
 
-		// Re-register each block that was used in the cached content
+		// Re-enqueue each used block's declared assets as a safety net for
+		// handles the block type registers at init (its style_handles /
+		// view_script_handles) which the diff may not cover.
 		$all_blocks = WP_Block_Type_Registry::get_instance()->get_all_registered();
-
 		foreach ( $all_blocks as $block_type ) {
-			if ( ! array_key_exists( $block_type->name, $data['used_blocks'] ) ) {
+			if ( ! array_key_exists( $block_type->name, $data['used_blocks'] ?? [] ) ) {
 				continue;
 			}
-
 			if ( ! empty( $block_type->view_script_handles ) ) {
 				foreach ( $block_type->view_script_handles as $handle ) {
 					wp_enqueue_script( $handle );
@@ -216,7 +326,7 @@ namespace {
 		/**
 		 * Perform additional actions when outputting cached content.
 		 *
-		 * @param [] $data Data in cache.
+		 * @param array $data Data in cache.
 		 */
 		do_action( 'cached_content_output', $data );
 
